@@ -1,0 +1,4 @@
+/target/
+/astra-code-runs/
+*.swp
+*.tmp

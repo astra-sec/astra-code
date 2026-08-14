@@ -1,0 +1,17 @@
+[package]
+name = "astra-code"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Run coding harnesses inside astra-kali from a single host CLI"
+repository = "https://github.com/astra-sec/astra-code"
+publish = false
+
+[[bin]]
+name = "astra-code"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
