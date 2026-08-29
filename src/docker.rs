@@ -1,4 +1,4 @@
-use crate::model::{Job, Profile, PromptSource, RunOptions, SecretSource};
+use crate::model::{Harness, Job, Profile, PromptSource, ReadOnlyMount, RunOptions, SecretSource};
 use crate::protocol;
 use crate::util::{
     create_private_dir, create_private_file, json_string, shell_join, unix_timestamp, write_private,
@@ -12,6 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+const CLAUDE_UID: u32 = 1000;
+const CLAUDE_GID: u32 = 1000;
 
 pub fn run(options: RunOptions) -> Result<i32, String> {
     let workspace = options
@@ -25,10 +27,14 @@ pub fn run(options: RunOptions) -> Result<i32, String> {
         ));
     }
 
+    let read_only_mounts = resolve_read_only_mounts(&options.read_only_mounts)?;
     let executable = std::env::current_exe()
         .and_then(|path| path.canonicalize())
         .map_err(|e| format!("locate astra-code executable: {e}"))?;
-    let run_id = format!("astra-code-{}-{}", unix_timestamp(), std::process::id());
+    let run_id = options
+        .run_id
+        .clone()
+        .unwrap_or_else(|| format!("astra-code-{}-{}", unix_timestamp(), std::process::id()));
     let (base_url, needs_host_gateway) = container_base_url(&options.base_url, &options.network);
     let args = docker_args(
         &options,
@@ -37,6 +43,7 @@ pub fn run(options: RunOptions) -> Result<i32, String> {
         &run_id,
         &base_url,
         needs_host_gateway,
+        &read_only_mounts,
     );
 
     if options.dry_run {
@@ -63,6 +70,7 @@ pub fn run(options: RunOptions) -> Result<i32, String> {
         model: options.model.clone(),
         token,
         prompt,
+        claude: options.claude.clone(),
     };
 
     let output = options
@@ -139,7 +147,10 @@ pub fn run(options: RunOptions) -> Result<i32, String> {
 }
 
 pub fn doctor(image: &str) -> Result<i32, String> {
-    let script = "set -eu; codex --version; codex-chat --version; claude --version; pi --version; opencode --version";
+    let script = "set -eu; test \"$(id -u kali)\" = 1000; test \"$(id -g kali)\" = 1000; \
+                  codex --version; claude --version; pi --version; opencode --version; \
+                  if command -v codex-chat >/dev/null 2>&1; then codex-chat --version; \
+                  else echo 'codex-chat: not installed (optional legacy Chat Completions adapter)'; fi";
     let status = Command::new("docker")
         .args([
             "run",
@@ -152,6 +163,30 @@ pub fn doctor(image: &str) -> Result<i32, String> {
         ])
         .status()
         .map_err(|e| format!("start docker: {e}"))?;
+    let root_code = status.code().unwrap_or(1);
+    if root_code != 0 {
+        return Ok(root_code);
+    }
+
+    let non_root_script = "set -eu; test \"$(id -u)\" = 1000; test \"$(id -g)\" = 1000; \
+                           test \"$HOME\" = /home/kali; codex --version; claude --version; \
+                           pi --version; opencode --version; playwright-cli --version";
+    let status = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--user",
+            "1000:1000",
+            "--workdir",
+            "/home/kali",
+            "--entrypoint",
+            "/bin/bash",
+            image,
+            "-lc",
+            non_root_script,
+        ])
+        .status()
+        .map_err(|e| format!("start non-root docker doctor: {e}"))?;
     Ok(status.code().unwrap_or(1))
 }
 
@@ -162,13 +197,14 @@ fn docker_args(
     run_id: &str,
     base_url: &str,
     needs_host_gateway: bool,
+    read_only_mounts: &[ReadOnlyMount],
 ) -> Vec<String> {
-    let ids = effective_ids();
-    let tmpfs = match (options.profile, ids) {
-        (Profile::Safe, Some((uid, gid))) => {
+    let ids = runtime_ids(options.profile, options.harness, effective_ids());
+    let tmpfs = match ids {
+        Some((uid, gid)) => {
             format!("/run/astra-code:rw,noexec,nosuid,nodev,mode=0700,uid={uid},gid={gid}")
         }
-        _ => "/run/astra-code:rw,noexec,nosuid,nodev,mode=0700".to_owned(),
+        None => "/run/astra-code:rw,noexec,nosuid,nodev,mode=0700".to_owned(),
     };
     let mut args = vec![
         "run".to_owned(),
@@ -214,9 +250,6 @@ fn docker_args(
                 "--pids-limit".to_owned(),
                 "2048".to_owned(),
             ]);
-            if let Some((uid, gid)) = ids {
-                args.extend(["--user".to_owned(), format!("{uid}:{gid}")]);
-            }
         }
         Profile::Pentest => {
             args.extend([
@@ -228,6 +261,20 @@ fn docker_args(
                 "NET_ADMIN".to_owned(),
             ]);
         }
+    }
+    if let Some((uid, gid)) = ids {
+        args.extend(["--user".to_owned(), format!("{uid}:{gid}")]);
+    }
+
+    for mount in read_only_mounts {
+        args.extend([
+            "--mount".to_owned(),
+            format!(
+                "type=bind,src={},dst={},readonly",
+                mount.source.display(),
+                mount.target
+            ),
+        ]);
     }
 
     for dns in &options.dns {
@@ -255,6 +302,24 @@ fn docker_args(
     ]);
     debug_assert!(!args.iter().any(|arg| arg == base_url));
     args
+}
+
+fn resolve_read_only_mounts(mounts: &[ReadOnlyMount]) -> Result<Vec<ReadOnlyMount>, String> {
+    mounts
+        .iter()
+        .map(|mount| {
+            let source = mount.source.canonicalize().map_err(|error| {
+                format!(
+                    "open read-only mount source {}: {error}",
+                    mount.source.display()
+                )
+            })?;
+            Ok(ReadOnlyMount {
+                source,
+                target: mount.target.clone(),
+            })
+        })
+        .collect()
 }
 
 fn read_secret(source: &SecretSource) -> Result<String, String> {
@@ -408,6 +473,18 @@ fn effective_ids() -> Option<(u32, u32)> {
     Some(unsafe { (geteuid(), getegid()) })
 }
 
+fn runtime_ids(
+    profile: Profile,
+    harness: Harness,
+    host_ids: Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    match (profile, harness) {
+        (_, Harness::Claude) => Some((CLAUDE_UID, CLAUDE_GID)),
+        (Profile::Safe, _) => host_ids,
+        (Profile::Pentest, _) => Some((0, 0)),
+    }
+}
+
 #[cfg(not(unix))]
 fn effective_ids() -> Option<(u32, u32)> {
     None
@@ -434,7 +511,8 @@ fn install_signal_handlers() {}
 
 #[cfg(test)]
 mod tests {
-    use super::container_base_url;
+    use super::{container_base_url, runtime_ids};
+    use crate::model::{Harness, Profile};
 
     #[test]
     fn rewrites_loopback_for_bridge_network() {
@@ -457,6 +535,30 @@ mod tests {
         assert_eq!(
             container_base_url("https://api.example/v1", "bridge"),
             ("https://api.example/v1".to_owned(), false)
+        );
+    }
+
+    #[test]
+    fn claude_always_uses_the_non_root_runtime_account() {
+        assert_eq!(
+            runtime_ids(Profile::Safe, Harness::Claude, Some((2000, 3000))),
+            Some((1000, 1000))
+        );
+        assert_eq!(
+            runtime_ids(Profile::Pentest, Harness::Claude, Some((2000, 3000))),
+            Some((1000, 1000))
+        );
+    }
+
+    #[test]
+    fn other_harnesses_keep_the_profile_identity() {
+        assert_eq!(
+            runtime_ids(Profile::Safe, Harness::Codex, Some((2000, 3000))),
+            Some((2000, 3000))
+        );
+        assert_eq!(
+            runtime_ids(Profile::Pentest, Harness::Codex, Some((2000, 3000))),
+            Some((0, 0))
         );
     }
 }

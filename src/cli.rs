@@ -1,5 +1,6 @@
 use crate::model::{
-    ApiProtocol, Harness, Profile, PromptSource, RunOptions, SecretSource, validate_pair,
+    ApiProtocol, ClaudeOptions, Harness, Profile, PromptSource, ReadOnlyMount, RunOptions,
+    SecretSource, validate_pair,
 };
 use std::env;
 use std::path::PathBuf;
@@ -66,6 +67,7 @@ fn parse_run(args: Vec<String>) -> Result<Command, String> {
     let mut model = None;
     let mut token = None;
     let mut prompt = None;
+    let mut run_id = None;
     let mut workspace = env::current_dir().map_err(|e| format!("read current directory: {e}"))?;
     let mut output = None;
     let mut image = "astra-kali:latest".to_owned();
@@ -77,6 +79,8 @@ fn parse_run(args: Vec<String>) -> Result<Command, String> {
     let mut dry_run = false;
     let mut dns = Vec::new();
     let mut dns_tcp = false;
+    let mut read_only_mounts = Vec::new();
+    let mut claude = ClaudeOptions::default();
 
     let mut index = 0;
     while index < args.len() {
@@ -123,6 +127,11 @@ fn parse_run(args: Vec<String>) -> Result<Command, String> {
                 )?)),
                 "prompt source",
             )?,
+            "--run-id" => set_once(
+                &mut run_id,
+                take_value(&args, &mut index, "--run-id")?,
+                "run ID",
+            )?,
             "--workspace" => {
                 workspace = PathBuf::from(take_value(&args, &mut index, "--workspace")?)
             }
@@ -146,6 +155,38 @@ fn parse_run(args: Vec<String>) -> Result<Command, String> {
             "--dry-run" => dry_run = true,
             "--dns" => dns.push(take_value(&args, &mut index, "--dns")?),
             "--dns-tcp" => dns_tcp = true,
+            "--read-only-mount" => read_only_mounts.push(parse_read_only_mount(&take_value(
+                &args,
+                &mut index,
+                "--read-only-mount",
+            )?)?),
+            "--claude-effort" => {
+                let effort = take_value(&args, &mut index, "--claude-effort")?;
+                if !matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh" | "max") {
+                    return Err(format!(
+                        "invalid --claude-effort {effort:?}; expected low, medium, high, xhigh, or max"
+                    ));
+                }
+                set_once(&mut claude.effort, effort, "Claude effort")?;
+            }
+            "--claude-max-turns" => {
+                let raw = take_value(&args, &mut index, "--claude-max-turns")?;
+                let value = raw.parse::<u64>().map_err(|_| {
+                    format!("invalid --claude-max-turns {raw:?}; expected an integer")
+                })?;
+                if value == 0 {
+                    return Err("--claude-max-turns must be greater than zero".to_owned());
+                }
+                set_once(&mut claude.max_turns, value, "Claude max turns")?;
+            }
+            "--claude-allowed-tool" => claude.allowed_tools.push(require_tool_name(
+                take_value(&args, &mut index, "--claude-allowed-tool")?,
+                "--claude-allowed-tool",
+            )?),
+            "--claude-disallowed-tool" => claude.disallowed_tools.push(require_tool_name(
+                take_value(&args, &mut index, "--claude-disallowed-tool")?,
+                "--claude-disallowed-tool",
+            )?),
             "--help" | "-h" => {
                 print_run_help();
                 return Ok(Command::Printed);
@@ -158,6 +199,9 @@ fn parse_run(args: Vec<String>) -> Result<Command, String> {
     let harness = harness.ok_or("missing required --harness")?;
     let api = api.ok_or("missing required --api")?;
     validate_pair(harness, api)?;
+    if harness != Harness::Claude && !claude.is_empty() {
+        return Err("--claude-* options require --harness claude".to_owned());
+    }
 
     let base_url = require_non_empty(base_url, "--base-url")?;
     if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
@@ -165,6 +209,9 @@ fn parse_run(args: Vec<String>) -> Result<Command, String> {
     }
     let model = require_non_empty(model, "--model")?;
     let token = token.ok_or("missing token source; use --token-env or --token-file")?;
+    if let Some(value) = run_id.as_deref() {
+        validate_run_id(value)?;
+    }
 
     Ok(Command::Run(Box::new(RunOptions {
         harness,
@@ -173,6 +220,7 @@ fn parse_run(args: Vec<String>) -> Result<Command, String> {
         model,
         token,
         prompt: prompt.unwrap_or(PromptSource::Stdin),
+        run_id,
         workspace,
         output,
         image,
@@ -184,7 +232,56 @@ fn parse_run(args: Vec<String>) -> Result<Command, String> {
         dry_run,
         dns,
         dns_tcp,
+        read_only_mounts,
+        claude,
     })))
+}
+
+fn validate_run_id(value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > 128 {
+        return Err("--run-id must contain between 1 and 128 characters".to_owned());
+    }
+    let mut chars = value.chars();
+    let first = chars.next().expect("non-empty run ID");
+    if !first.is_ascii_alphanumeric()
+        || !chars.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
+    {
+        return Err(
+            "--run-id must start with an ASCII letter or digit and contain only ASCII letters, digits, '.', '_', or '-'"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn parse_read_only_mount(value: &str) -> Result<ReadOnlyMount, String> {
+    let (source, target) = value.rsplit_once(':').ok_or_else(|| {
+        format!("invalid --read-only-mount {value:?}; expected HOST_PATH:CONTAINER_PATH")
+    })?;
+    if source.is_empty() || !target.starts_with('/') || target == "/" {
+        return Err(format!(
+            "invalid --read-only-mount {value:?}; source must be non-empty and container path must be absolute and not '/'"
+        ));
+    }
+    if source.contains([',', '\n', '\r']) || target.contains([',', '\n', '\r']) {
+        return Err("--read-only-mount paths cannot contain commas or newlines".to_owned());
+    }
+    Ok(ReadOnlyMount {
+        source: PathBuf::from(source),
+        target: target.to_owned(),
+    })
+}
+
+fn require_tool_name(value: String, option: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        Err(format!("{option} cannot be empty"))
+    } else if value.contains(['\n', '\r']) {
+        Err(format!("{option} cannot contain newlines"))
+    } else {
+        Ok(value)
+    }
 }
 
 fn take_value(args: &[String], index: &mut usize, option: &str) -> Result<String, String> {
@@ -240,18 +337,26 @@ pub fn print_run_help() {
            --prompt TEXT\n  \
              or --prompt-file PATH\n\n\
          Container:\n  \
+           --run-id ID          External run/container ID\n  \
            --workspace PATH     Directory mounted at /workspace (default: cwd)\n  \
            --image IMAGE        Default: astra-kali:latest\n  \
            --profile PROFILE    safe (default) or pentest\n  \
            --network NETWORK    Docker network mode (default: bridge)\n  \
            --read-only-workspace\n  \
+           --read-only-mount HOST_PATH:CONTAINER_PATH\n  \
+                                Repeatable extra read-only bind mount\n  \
            --dns SERVER         Repeatable Docker DNS setting\n  \
            --dns-tcp            Force Docker DNS over TCP\n\n\
          Execution:\n  \
            --timeout SECONDS    Default: 3600\n  \
            --output PATH        Run artifacts directory\n  \
            --keep-container     Do not pass --rm to Docker\n  \
-           --dry-run            Print a redacted Docker command only"
+           --dry-run            Print a redacted Docker command only\n\n\
+         Claude only:\n  \
+           --claude-effort LEVEL\n  \
+           --claude-max-turns COUNT\n  \
+           --claude-allowed-tool TOOL       Repeatable\n  \
+           --claude-disallowed-tool TOOL    Repeatable"
     );
 }
 
@@ -271,7 +376,8 @@ pub fn print_harnesses() {
 
 #[cfg(test)]
 mod tests {
-    use super::take_value;
+    use super::{parse_read_only_mount, take_value, validate_run_id};
+    use std::path::PathBuf;
 
     #[test]
     fn takes_option_value() {
@@ -282,5 +388,21 @@ mod tests {
             "gpt-test"
         );
         assert_eq!(index, 1);
+    }
+
+    #[test]
+    fn validates_external_run_ids() {
+        assert!(validate_run_id("eval-20260829_123456-abcdef012345").is_ok());
+        assert!(validate_run_id("../escape").is_err());
+        assert!(validate_run_id("contains space").is_err());
+    }
+
+    #[test]
+    fn parses_read_only_mounts() {
+        let mount = parse_read_only_mount("/host/templates:/codex/templates/cve").unwrap();
+        assert_eq!(mount.source, PathBuf::from("/host/templates"));
+        assert_eq!(mount.target, "/codex/templates/cve");
+        assert!(parse_read_only_mount("relative-only").is_err());
+        assert!(parse_read_only_mount("/host:/").is_err());
     }
 }

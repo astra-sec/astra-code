@@ -129,6 +129,29 @@ pub enum PromptSource {
     Stdin,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadOnlyMount {
+    pub source: PathBuf,
+    pub target: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClaudeOptions {
+    pub effort: Option<String>,
+    pub max_turns: Option<u64>,
+    pub allowed_tools: Vec<String>,
+    pub disallowed_tools: Vec<String>,
+}
+
+impl ClaudeOptions {
+    pub fn is_empty(&self) -> bool {
+        self.effort.is_none()
+            && self.max_turns.is_none()
+            && self.allowed_tools.is_empty()
+            && self.disallowed_tools.is_empty()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RunOptions {
     pub harness: Harness,
@@ -137,6 +160,7 @@ pub struct RunOptions {
     pub model: String,
     pub token: SecretSource,
     pub prompt: PromptSource,
+    pub run_id: Option<String>,
     pub workspace: PathBuf,
     pub output: Option<PathBuf>,
     pub image: String,
@@ -148,6 +172,8 @@ pub struct RunOptions {
     pub dry_run: bool,
     pub dns: Vec<String>,
     pub dns_tcp: bool,
+    pub read_only_mounts: Vec<ReadOnlyMount>,
+    pub claude: ClaudeOptions,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -158,6 +184,7 @@ pub struct Job {
     pub model: String,
     pub token: String,
     pub prompt: String,
+    pub claude: ClaudeOptions,
 }
 
 pub fn validate_pair(harness: Harness, api: ApiProtocol) -> Result<(), String> {

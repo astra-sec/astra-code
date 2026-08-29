@@ -14,6 +14,20 @@ struct Invocation {
     stdin: Option<Vec<u8>>,
 }
 
+const RUNTIME_ENV_ALLOWLIST: &[&str] = &[
+    "PLAYWRIGHT_BROWSERS_PATH",
+    "PLAYWRIGHT_SKIP_BROWSER_GC",
+    "PLAYWRIGHT_MCP_CONFIG",
+    "IDA_ROOT",
+    "IDA_NO_MCP_USER_DIR",
+    "IDA_DEFAULT_USER_DIR",
+    "IDA_HOST_USER_DIR",
+    "ASTRA_IDA_USER_DIR",
+    "ASTRA_IDA_AUTO_PYTHON",
+    "PYTHONPATH",
+    "PYTHONUNBUFFERED",
+];
+
 pub fn run_shim() -> Result<i32, String> {
     let job = protocol::read_job(io::stdin().lock())?;
     validate_pair(job.harness, job.api)?;
@@ -74,10 +88,12 @@ fn build_invocation(job: &Job, state_dir: &Path) -> Result<Invocation, String> {
 }
 
 fn common_env(home: &Path) -> BTreeMap<String, String> {
-    BTreeMap::from([
+    let mut environment = BTreeMap::from([
         (
             "PATH".to_owned(),
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned(),
+            env::var("PATH").unwrap_or_else(|_| {
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned()
+            }),
         ),
         ("HOME".to_owned(), home.display().to_string()),
         ("LANG".to_owned(), "C.UTF-8".to_owned()),
@@ -85,7 +101,13 @@ fn common_env(home: &Path) -> BTreeMap<String, String> {
         ("TERM".to_owned(), "dumb".to_owned()),
         ("NO_COLOR".to_owned(), "1".to_owned()),
         ("DO_NOT_TRACK".to_owned(), "1".to_owned()),
-    ])
+    ]);
+    for key in RUNTIME_ENV_ALLOWLIST {
+        if let Ok(value) = env::var(key) {
+            environment.insert((*key).to_owned(), value);
+        }
+    }
+    environment
 }
 
 fn codex(job: &Job, state_dir: &Path) -> Result<Invocation, String> {
@@ -152,22 +174,41 @@ fn claude(job: &Job, state_dir: &Path) -> Result<Invocation, String> {
     environment.insert("DISABLE_ERROR_REPORTING".to_owned(), "1".to_owned());
     environment.insert("DISABLE_AUTOUPDATER".to_owned(), "1".to_owned());
 
+    let mut args = vec![
+        "--bare".to_owned(),
+        "-p".to_owned(),
+        "--output-format".to_owned(),
+        "stream-json".to_owned(),
+        "--verbose".to_owned(),
+        "--no-session-persistence".to_owned(),
+        "--dangerously-skip-permissions".to_owned(),
+        "--model".to_owned(),
+        job.model.clone(),
+    ];
+    if let Some(effort) = &job.claude.effort {
+        args.extend(["--effort".to_owned(), effort.clone()]);
+    }
+    if let Some(max_turns) = job.claude.max_turns {
+        args.extend(["--max-turns".to_owned(), max_turns.to_string()]);
+    }
+    if !job.claude.allowed_tools.is_empty() {
+        args.extend([
+            "--allowed-tools".to_owned(),
+            job.claude.allowed_tools.join(","),
+        ]);
+    }
+    if !job.claude.disallowed_tools.is_empty() {
+        args.extend([
+            "--disallowed-tools".to_owned(),
+            job.claude.disallowed_tools.join(","),
+        ]);
+    }
+
     Ok(Invocation {
         program: "claude",
-        args: vec![
-            "--bare".to_owned(),
-            "-p".to_owned(),
-            "--output-format".to_owned(),
-            "stream-json".to_owned(),
-            "--verbose".to_owned(),
-            "--no-session-persistence".to_owned(),
-            "--dangerously-skip-permissions".to_owned(),
-            "--model".to_owned(),
-            job.model.clone(),
-            job.prompt.clone(),
-        ],
+        args,
         env: environment,
-        stdin: None,
+        stdin: Some(job.prompt.as_bytes().to_vec()),
     })
 }
 
@@ -265,8 +306,8 @@ fn opencode(job: &Job, state_dir: &Path) -> Result<Invocation, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::build_invocation;
-    use crate::model::{ApiProtocol, Harness, Job};
+    use super::{RUNTIME_ENV_ALLOWLIST, build_invocation};
+    use crate::model::{ApiProtocol, ClaudeOptions, Harness, Job};
     use std::path::Path;
 
     fn job(harness: Harness, api: ApiProtocol) -> Job {
@@ -277,6 +318,7 @@ mod tests {
             model: "example-model".to_owned(),
             token: "never-write-me".to_owned(),
             prompt: "inspect this project".to_owned(),
+            claude: ClaudeOptions::default(),
         }
     }
 
@@ -312,5 +354,55 @@ mod tests {
                 .any(|arg| arg.contains("never-write-me"))
         );
         let _ = std::fs::remove_dir_all(temporary);
+    }
+
+    #[test]
+    fn claude_options_are_forwarded_without_putting_prompt_in_arguments() {
+        let temporary =
+            std::env::temp_dir().join(format!("astra-code-test-claude-{}", std::process::id()));
+        let mut request = job(Harness::Claude, ApiProtocol::AnthropicMessages);
+        request.claude = ClaudeOptions {
+            effort: Some("high".to_owned()),
+            max_turns: Some(12),
+            allowed_tools: vec!["Read".to_owned()],
+            disallowed_tools: vec!["WebSearch".to_owned(), "WebFetch".to_owned()],
+        };
+        let invocation = build_invocation(&request, &temporary).unwrap();
+        assert!(
+            invocation
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--effort", "high"])
+        );
+        assert!(
+            invocation
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--max-turns", "12"])
+        );
+        assert!(
+            invocation
+                .args
+                .windows(2)
+                .any(|pair| { pair == ["--disallowed-tools", "WebSearch,WebFetch"] })
+        );
+        assert!(!invocation.args.iter().any(|arg| arg == &request.prompt));
+        assert_eq!(invocation.stdin, Some(request.prompt.as_bytes().to_vec()));
+        let _ = std::fs::remove_dir_all(temporary);
+    }
+
+    #[test]
+    fn runtime_environment_allows_playwright_and_ida_configuration() {
+        for key in [
+            "PLAYWRIGHT_BROWSERS_PATH",
+            "PLAYWRIGHT_MCP_CONFIG",
+            "IDA_ROOT",
+            "IDA_NO_MCP_USER_DIR",
+            "IDA_DEFAULT_USER_DIR",
+            "ASTRA_IDA_USER_DIR",
+            "ASTRA_IDA_AUTO_PYTHON",
+        ] {
+            assert!(RUNTIME_ENV_ALLOWLIST.contains(&key), "missing {key}");
+        }
     }
 }

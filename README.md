@@ -27,9 +27,9 @@ cargo build --release
 ./target/release/astra-code doctor --image astra-kali:latest
 ```
 
-`doctor` checks that all harness executables exist in the selected image. Codex
-uses the current binary for Responses and a pinned `codex-chat` 0.80.0 binary
-for the legacy Chat Completions protocol removed from current Codex releases.
+`doctor` checks that the current Codex, Claude, Pi, and OpenCode executables
+exist in the selected image. A `codex-chat` 0.80.0 binary is detected when
+present but is optional; only the legacy Chat Completions path needs it.
 
 ## Run
 
@@ -63,6 +63,16 @@ astra-code run \
   --prompt-file task.md
 ```
 
+Claude-specific execution controls are explicit and optional:
+
+```sh
+astra-code run ... \
+  --claude-effort high \
+  --claude-max-turns 100 \
+  --claude-disallowed-tool WebSearch \
+  --claude-disallowed-tool WebFetch
+```
+
 Codex, Pi, and OpenCode accept these OpenAI protocol values:
 
 ```text
@@ -75,6 +85,10 @@ Pi and OpenCode additionally accept `anthropic-messages`. Claude requires it.
 If neither `--prompt` nor `--prompt-file` is present, the prompt is read from
 stdin. Use `--dry-run` to inspect the complete, redacted Docker command without
 reading the token or starting a container.
+
+An orchestrator can supply a stable Docker/artifact identifier with `--run-id`.
+Run IDs must be Docker-name-safe. Extra host data can be exposed without write
+access using repeatable `--read-only-mount HOST_PATH:CONTAINER_PATH` options.
 
 ## Networking
 
@@ -93,9 +107,20 @@ astra-code run ... --dns 223.5.5.5 --dns-tcp
 ## Profiles and artifacts
 
 The default `safe` profile drops all Linux capabilities, enables
-`no-new-privileges`, and runs as the host UID/GID. The `pentest` profile runs as
-root and grants only `NET_RAW` and `NET_ADMIN`; it does not mount the Docker
-socket and does not use `--privileged`.
+`no-new-privileges`, and normally runs as the host UID/GID. The `pentest`
+profile normally runs as root and grants only `NET_RAW` and `NET_ADMIN`; it does
+not mount the Docker socket and does not use `--privileged`.
+
+Claude is the deliberate exception for both profiles: it runs as the image's
+`kali:kali` account (`1000:1000`) because Claude Code rejects unattended
+permission bypass under root. The mounted workspace must therefore be writable
+by UID 1000. The run-scoped tmpfs and ephemeral HOME are assigned to the same
+identity. Other harnesses retain the normal profile identity described above.
+
+The shim clears the harness environment and restores only a small runtime
+allowlist from the image. This includes the image `PATH`, Playwright browser and
+configuration variables, IDA wrapper variables, and Python runtime paths. LLM
+credentials are still supplied only by astra-code itself.
 
 Each run writes the following files in a mode `0700` directory. Files are
 created with mode `0600`:
