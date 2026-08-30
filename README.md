@@ -111,11 +111,13 @@ The default `safe` profile drops all Linux capabilities, enables
 profile normally runs as root and grants only `NET_RAW` and `NET_ADMIN`; it does
 not mount the Docker socket and does not use `--privileged`.
 
-Claude is the deliberate exception for both profiles: it runs as the image's
-`kali:kali` account (`1000:1000`) because Claude Code rejects unattended
-permission bypass under root. The mounted workspace must therefore be writable
-by UID 1000. The run-scoped tmpfs and ephemeral HOME are assigned to the same
-identity. Other harnesses retain the normal profile identity described above.
+Claude is the deliberate exception for both profiles: it rejects unattended
+permission bypass under root, so astra-code runs it as the invoking caller's
+non-root UID/GID. The mounted workspace and the run-scoped tmpfs/ephemeral HOME
+are assigned to that same identity; no fixed image account or numeric UID is
+required. A root caller must use a non-root service account when selecting the
+Claude harness. Other harnesses retain the normal profile identity described
+above.
 
 The shim clears the harness environment and restores only a small runtime
 allowlist from the image. This includes the image `PATH`, Playwright browser and

@@ -12,8 +12,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-const CLAUDE_UID: u32 = 1000;
-const CLAUDE_GID: u32 = 1000;
 
 pub fn run(options: RunOptions) -> Result<i32, String> {
     let workspace = options
@@ -44,7 +42,7 @@ pub fn run(options: RunOptions) -> Result<i32, String> {
         &base_url,
         needs_host_gateway,
         &read_only_mounts,
-    );
+    )?;
 
     if options.dry_run {
         println!("{}", shell_join("docker", &args));
@@ -147,7 +145,7 @@ pub fn run(options: RunOptions) -> Result<i32, String> {
 }
 
 pub fn doctor(image: &str) -> Result<i32, String> {
-    let script = "set -eu; test \"$(id -u kali)\" = 1000; test \"$(id -g kali)\" = 1000; \
+    let script = "set -eu; \
                   codex --version; claude --version; pi --version; opencode --version; \
                   if command -v codex-chat >/dev/null 2>&1; then codex-chat --version; \
                   else echo 'codex-chat: not installed (optional legacy Chat Completions adapter)'; fi";
@@ -168,17 +166,19 @@ pub fn doctor(image: &str) -> Result<i32, String> {
         return Ok(root_code);
     }
 
-    let non_root_script = "set -eu; test \"$(id -u)\" = 1000; test \"$(id -g)\" = 1000; \
-                           test \"$HOME\" = /home/kali; codex --version; claude --version; \
+    let non_root_script = "set -eu; test \"$HOME\" = /tmp; codex --version; claude --version; \
                            pi --version; opencode --version; playwright-cli --version";
+    let (uid, gid) = effective_ids()
+        .ok_or_else(|| "non-root doctor check requires Unix caller IDs".to_owned())?;
+    let (uid, gid) = if uid == 0 { (65534, 65534) } else { (uid, gid) };
     let status = Command::new("docker")
+        .args(["run", "--rm", "--user"])
+        .arg(format!("{uid}:{gid}"))
         .args([
-            "run",
-            "--rm",
-            "--user",
-            "1000:1000",
             "--workdir",
-            "/home/kali",
+            "/tmp",
+            "--env",
+            "HOME=/tmp",
             "--entrypoint",
             "/bin/bash",
             image,
@@ -198,8 +198,8 @@ fn docker_args(
     base_url: &str,
     needs_host_gateway: bool,
     read_only_mounts: &[ReadOnlyMount],
-) -> Vec<String> {
-    let ids = runtime_ids(options.profile, options.harness, effective_ids());
+) -> Result<Vec<String>, String> {
+    let ids = runtime_ids(options.profile, options.harness, effective_ids())?;
     let tmpfs = match ids {
         Some((uid, gid)) => {
             format!("/run/astra-code:rw,noexec,nosuid,nodev,mode=0700,uid={uid},gid={gid}")
@@ -301,7 +301,7 @@ fn docker_args(
         "shim".to_owned(),
     ]);
     debug_assert!(!args.iter().any(|arg| arg == base_url));
-    args
+    Ok(args)
 }
 
 fn resolve_read_only_mounts(mounts: &[ReadOnlyMount]) -> Result<Vec<ReadOnlyMount>, String> {
@@ -477,11 +477,18 @@ fn runtime_ids(
     profile: Profile,
     harness: Harness,
     host_ids: Option<(u32, u32)>,
-) -> Option<(u32, u32)> {
+) -> Result<Option<(u32, u32)>, String> {
     match (profile, harness) {
-        (_, Harness::Claude) => Some((CLAUDE_UID, CLAUDE_GID)),
-        (Profile::Safe, _) => host_ids,
-        (Profile::Pentest, _) => Some((0, 0)),
+        (_, Harness::Claude) => match host_ids {
+            Some((0, _)) => Err(
+                "Claude Code requires a non-root caller; run astra-code as the user that owns the workspace"
+                    .to_owned(),
+            ),
+            Some(ids) => Ok(Some(ids)),
+            None => Err("Claude Code requires Unix caller UID/GID".to_owned()),
+        },
+        (Profile::Safe, _) => Ok(host_ids),
+        (Profile::Pentest, _) => Ok(Some((0, 0))),
     }
 }
 
@@ -539,26 +546,32 @@ mod tests {
     }
 
     #[test]
-    fn claude_always_uses_the_non_root_runtime_account() {
+    fn claude_follows_the_non_root_caller_identity() {
         assert_eq!(
             runtime_ids(Profile::Safe, Harness::Claude, Some((2000, 3000))),
-            Some((1000, 1000))
+            Ok(Some((2000, 3000)))
         );
         assert_eq!(
             runtime_ids(Profile::Pentest, Harness::Claude, Some((2000, 3000))),
-            Some((1000, 1000))
+            Ok(Some((2000, 3000)))
         );
+    }
+
+    #[test]
+    fn claude_rejects_a_root_caller() {
+        let error = runtime_ids(Profile::Safe, Harness::Claude, Some((0, 0))).unwrap_err();
+        assert!(error.contains("non-root"));
     }
 
     #[test]
     fn other_harnesses_keep_the_profile_identity() {
         assert_eq!(
             runtime_ids(Profile::Safe, Harness::Codex, Some((2000, 3000))),
-            Some((2000, 3000))
+            Ok(Some((2000, 3000)))
         );
         assert_eq!(
             runtime_ids(Profile::Pentest, Harness::Codex, Some((2000, 3000))),
-            Some((0, 0))
+            Ok(Some((0, 0)))
         );
     }
 }
