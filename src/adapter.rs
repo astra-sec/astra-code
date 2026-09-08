@@ -31,9 +31,6 @@ const RUNTIME_ENV_ALLOWLIST: &[&str] = &[
 pub fn run_shim() -> Result<i32, String> {
     let job = protocol::read_job(io::stdin().lock())?;
     validate_pair(job.harness, job.api)?;
-    if job.token.is_empty() {
-        return Err("API token is empty".to_owned());
-    }
 
     let state_dir = PathBuf::from(
         env::var_os("ASTRA_CODE_STATE_DIR").unwrap_or_else(|| "/run/astra-code".into()),
@@ -79,6 +76,18 @@ pub fn run_shim() -> Result<i32, String> {
 }
 
 fn build_invocation(job: &Job, state_dir: &Path) -> Result<Invocation, String> {
+    if job.host_auth {
+        if job.harness != Harness::Codex || job.api != ApiProtocol::OpenAiResponses {
+            return Err("host authentication requires codex with openai-responses".to_owned());
+        }
+        if !job.token.is_empty() || !job.base_url.is_empty() {
+            return Err(
+                "host authentication cannot include an API token or custom base URL".to_owned(),
+            );
+        }
+    } else if job.token.is_empty() {
+        return Err("API token is empty".to_owned());
+    }
     match job.harness {
         Harness::Codex => codex(job, state_dir),
         Harness::Claude => claude(job, state_dir),
@@ -120,24 +129,49 @@ fn codex(job: &Job, state_dir: &Path) -> Result<Invocation, String> {
     };
     let home = state_dir.join("home");
     let codex_home = state_dir.join("codex");
-    let config = format!(
-        "model = {}\n\
-         model_provider = \"astra\"\n\
-         approval_policy = \"never\"\n\
-         sandbox_mode = \"danger-full-access\"\n\n\
-         [model_providers.astra]\n\
-         name = \"ASTRA custom provider\"\n\
-         base_url = {}\n\
-         env_key = \"ASTRA_API_TOKEN\"\n\
-         wire_api = {}\n",
-        toml_string(&job.model),
-        toml_string(&job.base_url),
-        toml_string(wire_api),
-    );
+    let effort_config = job
+        .codex_effort
+        .as_deref()
+        .map(|effort| format!("model_reasoning_effort = {}\n", toml_string(effort)))
+        .unwrap_or_default();
+    let config = if job.host_auth {
+        if !codex_home.join("auth.json").is_file() {
+            return Err("host authentication requires a mounted Codex auth.json file".to_owned());
+        }
+        format!(
+            "model = {}\n\
+             {}\
+             model_provider = \"openai\"\n\
+             cli_auth_credentials_store = \"file\"\n\
+             approval_policy = \"never\"\n\
+             sandbox_mode = \"danger-full-access\"\n",
+            toml_string(&job.model),
+            effort_config,
+        )
+    } else {
+        format!(
+            "model = {}\n\
+             {}\
+             model_provider = \"astra\"\n\
+             approval_policy = \"never\"\n\
+             sandbox_mode = \"danger-full-access\"\n\n\
+             [model_providers.astra]\n\
+             name = \"ASTRA custom provider\"\n\
+             base_url = {}\n\
+             env_key = \"ASTRA_API_TOKEN\"\n\
+             wire_api = {}\n",
+            toml_string(&job.model),
+            effort_config,
+            toml_string(&job.base_url),
+            toml_string(wire_api),
+        )
+    };
     write_private(&codex_home.join("config.toml"), &config)?;
     let mut environment = common_env(&home);
     environment.insert("CODEX_HOME".to_owned(), codex_home.display().to_string());
-    environment.insert("ASTRA_API_TOKEN".to_owned(), job.token.clone());
+    if !job.host_auth {
+        environment.insert("ASTRA_API_TOKEN".to_owned(), job.token.clone());
+    }
 
     let mut args = vec!["exec".to_owned(), "--json".to_owned()];
     if ephemeral {
@@ -317,9 +351,153 @@ mod tests {
             base_url: "https://gateway.example/v1".to_owned(),
             model: "example-model".to_owned(),
             token: "never-write-me".to_owned(),
+            host_auth: false,
             prompt: "inspect this project".to_owned(),
+            codex_effort: None,
             claude: ClaudeOptions::default(),
         }
+    }
+
+    #[test]
+    fn codex_host_auth_uses_native_provider_without_touching_credentials() {
+        let temporary = std::env::temp_dir().join(format!(
+            "astra-code-test-codex-host-auth-{}",
+            std::process::id()
+        ));
+        let codex_home = temporary.join("codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let fake_auth = "fake mounted credentials; do not parse or overwrite";
+        std::fs::write(codex_home.join("auth.json"), fake_auth).unwrap();
+        let mut request = job(Harness::Codex, ApiProtocol::OpenAiResponses);
+        request.host_auth = true;
+        request.token.clear();
+        request.base_url.clear();
+        request.model = "gpt-6-astra".to_owned();
+        request.codex_effort = Some("ultra".to_owned());
+
+        let invocation = build_invocation(&request, &temporary).unwrap();
+        let config = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(codex_home.join("auth.json")).unwrap(),
+            fake_auth
+        );
+        assert!(config.contains("model_provider = \"openai\""), "{config}");
+        assert!(
+            config.contains("cli_auth_credentials_store = \"file\""),
+            "{config}"
+        );
+        assert!(config.contains("model = \"gpt-6-astra\""), "{config}");
+        assert!(
+            config.contains("model_reasoning_effort = \"ultra\""),
+            "{config}"
+        );
+        for forbidden in [
+            "ASTRA_API_TOKEN",
+            "base_url",
+            "model_providers",
+            "fake mounted",
+        ] {
+            assert!(!config.contains(forbidden), "config contains {forbidden}");
+        }
+        for forbidden in [
+            "ASTRA_API_TOKEN",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+        ] {
+            assert!(
+                !invocation.env.contains_key(forbidden),
+                "environment contains {forbidden}"
+            );
+        }
+        assert_eq!(
+            invocation.env.get("CODEX_HOME"),
+            Some(&codex_home.display().to_string())
+        );
+        assert_eq!(invocation.program, "codex");
+        assert!(invocation.args.iter().any(|arg| arg == "--ephemeral"));
+        assert_eq!(invocation.stdin, Some(request.prompt.as_bytes().to_vec()));
+        let _ = std::fs::remove_dir_all(temporary);
+    }
+
+    #[test]
+    fn codex_host_auth_requires_mounted_auth_file() {
+        let temporary = std::env::temp_dir().join(format!(
+            "astra-code-test-codex-missing-host-auth-{}",
+            std::process::id()
+        ));
+        let mut request = job(Harness::Codex, ApiProtocol::OpenAiResponses);
+        request.host_auth = true;
+        request.token.clear();
+        request.base_url.clear();
+        let result = build_invocation(&request, &temporary);
+        assert!(matches!(result, Err(message) if message.contains("auth.json")));
+        let _ = std::fs::remove_dir_all(temporary);
+    }
+
+    #[test]
+    fn host_auth_rejects_custom_credentials_and_unsupported_harnesses() {
+        let temporary = std::env::temp_dir().join(format!(
+            "astra-code-test-invalid-host-auth-{}",
+            std::process::id()
+        ));
+        for (harness, api, token, base_url) in [
+            (
+                Harness::Codex,
+                ApiProtocol::OpenAiResponses,
+                "custom-token",
+                "",
+            ),
+            (
+                Harness::Codex,
+                ApiProtocol::OpenAiResponses,
+                "",
+                "https://gateway.example/v1",
+            ),
+            (Harness::Codex, ApiProtocol::OpenAiChatCompletions, "", ""),
+            (Harness::Claude, ApiProtocol::AnthropicMessages, "", ""),
+            (Harness::Pi, ApiProtocol::OpenAiResponses, "", ""),
+            (Harness::OpenCode, ApiProtocol::OpenAiResponses, "", ""),
+        ] {
+            let mut request = job(harness, api);
+            request.host_auth = true;
+            request.token = token.to_owned();
+            request.base_url = base_url.to_owned();
+            assert!(
+                build_invocation(&request, &temporary).is_err(),
+                "accepted incompatible host authentication"
+            );
+        }
+        let mut request = job(Harness::Codex, ApiProtocol::OpenAiResponses);
+        request.token.clear();
+        assert!(
+            build_invocation(&request, &temporary).is_err(),
+            "accepted empty ordinary API token"
+        );
+        let _ = std::fs::remove_dir_all(temporary);
+    }
+
+    #[test]
+    fn codex_effort_is_written_as_top_level_config() {
+        let temporary = std::env::temp_dir().join(format!(
+            "astra-code-test-codex-effort-{}",
+            std::process::id()
+        ));
+        let mut request = job(Harness::Codex, ApiProtocol::OpenAiResponses);
+        request.model = "gpt-6-astra".to_owned();
+        request.codex_effort = Some("ultra".to_owned());
+        let invocation = build_invocation(&request, &temporary).unwrap();
+        let config = std::fs::read_to_string(temporary.join("codex/config.toml")).unwrap();
+        let root = config.split("[model_providers.astra]").next().unwrap();
+        assert!(
+            root.contains("model_reasoning_effort = \"ultra\""),
+            "{config}"
+        );
+        assert_eq!(invocation.program, "codex");
+        assert!(!config.contains(&request.token));
+        assert!(!invocation.args.iter().any(|arg| arg.contains("claude")));
+        let _ = std::fs::remove_dir_all(temporary);
     }
 
     #[test]

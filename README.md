@@ -10,9 +10,10 @@ The same binary has two roles:
 - in the container, the hidden `shim` command writes an ephemeral harness
   configuration and execs Codex, Claude Code, Pi, or OpenCode.
 
-The API token and prompt travel through Docker stdin using a length-prefixed
+In API-token mode, the token and prompt travel through Docker stdin using a length-prefixed
 protocol. They are not included in `docker run` arguments, labels, or environment
 settings, so `docker inspect` does not expose them.
+Codex can also reuse the host's native login with `--host-auth`.
 
 ## Requirements
 
@@ -33,6 +34,38 @@ present but is optional; only the legacy Chat Completions path needs it.
 
 ## Run
 
+Codex using the host's existing ChatGPT login:
+
+```sh
+codex login status
+astra-code run \
+  --harness codex \
+  --host-auth \
+  --model gpt-6-astra \
+  --codex-effort ultra \
+  --image astra-kali:codex-ultra \
+  --workspace ./target-project \
+  --prompt 'Inspect the tests, fix the bug, and verify the result.'
+```
+
+`--host-auth` finds the file-backed login at `$CODEX_HOME/auth.json`, falling
+back to `$HOME/.codex/auth.json`. It shares only that file with the container,
+with write access so Codex can persist refreshed credentials for subsequent
+host and container runs. Codex 0.153.4 saves file credentials in place. The
+container's configuration, cache and session state remain isolated. Credentials
+are not copied into the job protocol, environment or run artifacts.
+
+This mode uses Codex's built-in OpenAI provider and `file` credential storage.
+A ChatGPT login therefore uses the native Codex service, without a third-party
+API gateway. Host provider settings, plugins and MCP configuration are not
+imported. File-backed API-key logins use the same native provider; keyring-only
+credentials require a file-backed login first. Account access still determines
+which models can run.
+
+The option currently requires `--harness codex`. `--api` may be omitted or set
+to `openai-responses`; `--base-url`, `--token-env` and `--token-file` cannot be
+combined with `--host-auth`. Other harnesses retain the API-token mode below.
+
 Codex against an OpenAI Responses-compatible gateway:
 
 ```sh
@@ -50,6 +83,44 @@ astra-code run \
 For a Chat Completions-only gateway, change the protocol to
 `--api openai-chat-completions`. The adapter automatically selects the isolated
 legacy Codex binary. Current Codex releases no longer support that protocol.
+
+Codex reasoning effort can be set explicitly with `--codex-effort`:
+
+```sh
+astra-code run ... --harness codex --api openai-responses \
+  --model gpt-6-astra --codex-effort ultra
+```
+
+Supported values are `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`.
+The value is written to the isolated Codex configuration as
+`model_reasoning_effort`; omitting it preserves the harness default. Both the
+selected model and the Codex executable in the image must support the requested
+level. For example, Codex 0.132.0 cannot parse `ultra`; a recent executable such
+as 0.153.4 is required. Updating the host astra-code executable does not update
+Codex inside the image. Prefer Responses for current models and effort levels.
+
+To create the separate `astra-kali:codex-ultra` image used above from a compatible
+Codex npm installation on the host (validated with 0.153.4):
+
+```sh
+(
+  set -eu
+  codex --version
+  codex_image_context="$(mktemp -d)"
+  cp -a "$(npm root -g)/@openai/codex" "$codex_image_context/codex"
+  cat > "$codex_image_context/Dockerfile" <<'DOCKERFILE'
+FROM astra-kali:latest
+COPY --chown=0:0 codex/ /opt/astra-codex/
+RUN chmod -R a+rX /opt/astra-codex && ln -sf /opt/astra-codex/bin/codex.js /usr/local/bin/codex
+DOCKERFILE
+  docker build -t astra-kali:codex-ultra "$codex_image_context"
+  rm -r -- "$codex_image_context"
+)
+```
+
+This copies the installed CLI package, including its platform binary. The image
+must match the host architecture; user credentials and Codex home configuration
+are supplied separately at runtime and are not part of the build context.
 
 Claude Code against an Anthropic Messages-compatible gateway:
 
@@ -137,11 +208,16 @@ treat the artifact directory as sensitive.
 
 ## Security model
 
-The token and prompt are delivered to the container shim over stdin, so they do
+In API-token mode, the token and prompt are delivered to the container shim over stdin, so they do
 not appear in `docker run` arguments, labels, or container configuration. The
 token is provided only in the selected harness process environment. Some
 harnesses receive the prompt as a child-process argument after the shim starts,
 which can be observed by a privileged host or container process.
+
+In host-auth mode, only the prompt uses stdin; Codex reads and refreshes the
+shared host `auth.json` file directly. The Docker command exposes that file's
+path, not its contents. The mount is writable to preserve native token refresh;
+the runner does not copy credentials into its output directory or protocol.
 
 The default `safe` profile is intended to reduce accidental host impact, not to
 make an untrusted image safe. A host administrator and a container process with
@@ -151,9 +227,10 @@ images with production credentials.
 
 ## Current scope
 
-This first version deliberately keeps the contract narrow: one task per
-container, raw harness event streams, no session resume, and no provider token
-stored on disk. Ephemeral config files refer to a child-only environment
-variable. The pinned legacy Codex binary is used only for Chat Completions and
+The contract remains one task per container, raw harness event streams and no
+session resume. In API-token mode, no provider token is stored on disk;
+ephemeral config files refer to a child-only environment variable. Host-auth
+mode reuses the existing file-backed Codex login and allows native refresh to
+update that file. The pinned legacy Codex binary is used only for Chat Completions and
 does not receive current Codex security or feature updates. Prefer Responses
 when the upstream gateway supports it.

@@ -120,6 +120,7 @@ impl FromStr for Profile {
 pub enum SecretSource {
     Env(String),
     File(PathBuf),
+    HostCodex(PathBuf),
 }
 
 #[derive(Clone, Debug)]
@@ -173,6 +174,7 @@ pub struct RunOptions {
     pub dns: Vec<String>,
     pub dns_tcp: bool,
     pub read_only_mounts: Vec<ReadOnlyMount>,
+    pub codex_effort: Option<String>,
     pub claude: ClaudeOptions,
 }
 
@@ -183,7 +185,9 @@ pub struct Job {
     pub base_url: String,
     pub model: String,
     pub token: String,
+    pub host_auth: bool,
     pub prompt: String,
+    pub codex_effort: Option<String>,
     pub claude: ClaudeOptions,
 }
 

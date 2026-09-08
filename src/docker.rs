@@ -46,15 +46,22 @@ pub fn run(options: RunOptions) -> Result<i32, String> {
 
     if options.dry_run {
         println!("{}", shell_join("docker", &args));
-        println!("# job credentials and prompt are sent over stdin; token is redacted");
+        if matches!(&options.token, SecretSource::HostCodex(_)) {
+            println!(
+                "# native Codex credentials use the auth.json bind mount; only the prompt is sent over stdin"
+            );
+        } else {
+            println!("# job credentials and prompt are sent over stdin; token is redacted");
+        }
         if base_url != options.base_url {
             println!("# base URL inside the container: {base_url}");
         }
         return Ok(0);
     }
 
+    let host_auth = matches!(&options.token, SecretSource::HostCodex(_));
     let token = read_secret(&options.token)?;
-    if token.is_empty() {
+    if !host_auth && token.is_empty() {
         return Err("token source contained an empty value".to_owned());
     }
     let prompt = read_prompt(&options.prompt)?;
@@ -67,7 +74,9 @@ pub fn run(options: RunOptions) -> Result<i32, String> {
         base_url,
         model: options.model.clone(),
         token,
+        host_auth,
         prompt,
+        codex_effort: options.codex_effort.clone(),
         claude: options.claude.clone(),
     };
 
@@ -266,6 +275,8 @@ fn docker_args(
         args.extend(["--user".to_owned(), format!("{uid}:{gid}")]);
     }
 
+    args.extend(host_auth_mount_args(&options.token, ids)?);
+
     for mount in read_only_mounts {
         args.extend([
             "--mount".to_owned(),
@@ -328,8 +339,45 @@ fn read_secret(source: &SecretSource) -> Result<String, String> {
             .map_err(|_| format!("token environment variable {name:?} is not set or not UTF-8"))?,
         SecretSource::File(path) => fs::read_to_string(path)
             .map_err(|e| format!("read token file {}: {e}", path.display()))?,
+        // Native credentials are mounted directly. Never read them into the
+        // job, command line, environment or output artifacts.
+        SecretSource::HostCodex(_) => return Ok(String::new()),
     };
     Ok(value.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+fn host_auth_mount_args(
+    source: &SecretSource,
+    ids: Option<(u32, u32)>,
+) -> Result<Vec<String>, String> {
+    let SecretSource::HostCodex(path) = source else {
+        return Ok(Vec::new());
+    };
+    let auth_file = path.canonicalize().map_err(|error| {
+        format!(
+            "open host Codex credentials {}: {error}; run codex login on the host with file credential storage",
+            path.display()
+        )
+    })?;
+    if !auth_file.is_file() {
+        return Err("host Codex credentials must be an auth.json file".to_owned());
+    }
+    // Docker may create a deep bind mount's parent as root. A separate tmpfs
+    // keeps Codex's isolated config/cache writable by the harness UID.
+    let ownership = ids
+        .map(|(uid, gid)| format!(",uid={uid},gid={gid}"))
+        .unwrap_or_default();
+    Ok(vec![
+        "--tmpfs".to_owned(),
+        format!("/run/astra-code/codex:rw,noexec,nosuid,nodev,mode=0700{ownership}"),
+        "--mount".to_owned(),
+        // Codex saves refreshed file credentials in place; writable access
+        // shares that refresh with the native host session.
+        format!(
+            "type=bind,src={},dst=/run/astra-code/codex/auth.json",
+            auth_file.display()
+        ),
+    ])
 }
 
 fn read_prompt(source: &PromptSource) -> Result<String, String> {
@@ -449,7 +497,7 @@ fn write_result_file(
     let document = format!(
         "{{\n  \"run_id\": {},\n  \"status\": {},\n  \"exit_code\": {},\n  \
          \"harness\": {},\n  \"api\": {},\n  \"model\": {},\n  \"image\": {},\n  \
-         \"profile\": {},\n  \"started_at\": {},\n  \"finished_at\": {}\n}}\n",
+         \"profile\": {},\n  \"auth_mode\": {},\n  \"started_at\": {},\n  \"finished_at\": {}\n}}\n",
         json_string(run_id),
         json_string(status),
         exit_code,
@@ -458,6 +506,11 @@ fn write_result_file(
         json_string(&options.model),
         json_string(&options.image),
         json_string(options.profile.as_str()),
+        json_string(if matches!(&options.token, SecretSource::HostCodex(_)) {
+            "host"
+        } else {
+            "api-token"
+        }),
         started_at,
         finished_at,
     );
@@ -518,8 +571,54 @@ fn install_signal_handlers() {}
 
 #[cfg(test)]
 mod tests {
-    use super::{container_base_url, runtime_ids};
-    use crate::model::{Harness, Profile};
+    use super::{container_base_url, host_auth_mount_args, read_secret, runtime_ids};
+    use crate::model::{Harness, Profile, SecretSource};
+
+    #[test]
+    fn host_auth_mounts_only_native_auth_file_and_preserves_refresh_writes() {
+        let directory =
+            std::env::temp_dir().join(format!("astra-host-auth-mount-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let auth = directory.join("auth.json");
+        std::fs::write(&auth, "credential-sentinel-not-for-output").unwrap();
+        let source = SecretSource::HostCodex(auth.clone());
+        let args = host_auth_mount_args(&source, Some((2000, 3000))).unwrap();
+        let mount = args.iter().find(|arg| arg.contains("type=bind")).unwrap();
+        assert!(mount.contains(&format!("src={},", auth.display())));
+        assert!(mount.ends_with("dst=/run/astra-code/codex/auth.json"));
+        assert!(
+            !mount.contains("readonly"),
+            "native token refresh must persist"
+        );
+        assert!(args.iter().any(
+            |arg| arg.contains("/run/astra-code/codex:rw") && arg.contains("uid=2000,gid=3000")
+        ));
+        assert!(!args.join(" ").contains("credential-sentinel"));
+        assert_eq!(
+            read_secret(&source).unwrap(),
+            "",
+            "host credentials must not enter the job protocol"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn host_auth_requires_a_file_and_api_credentials_add_no_auth_mount() {
+        let directory =
+            std::env::temp_dir().join(format!("astra-host-auth-invalid-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        for path in [directory.clone(), directory.join("missing.json")] {
+            assert!(
+                host_auth_mount_args(&SecretSource::HostCodex(path), Some((1000, 1000))).is_err()
+            );
+        }
+        assert!(
+            host_auth_mount_args(&SecretSource::Env("TEST_TOKEN".to_owned()), None)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn rewrites_loopback_for_bridge_network() {

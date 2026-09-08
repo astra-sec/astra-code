@@ -2,7 +2,7 @@ use crate::model::{ApiProtocol, Harness, Job};
 use std::io::{Read, Write};
 use std::str::FromStr;
 
-const MAGIC: &[u8] = b"ASTRA_CODE_JOB_V2\0";
+const MAGIC: &[u8] = b"ASTRA_CODE_JOB_V3\0";
 const MAX_FIELD_SIZE: usize = 64 * 1024 * 1024;
 const MAX_LIST_ITEMS: usize = 4096;
 
@@ -32,6 +32,11 @@ pub fn write_job(mut writer: impl Write, job: &Job) -> Result<(), String> {
     write_field(&mut writer, max_turns.as_bytes())?;
     write_string_list(&mut writer, &job.claude.allowed_tools)?;
     write_string_list(&mut writer, &job.claude.disallowed_tools)?;
+    write_field(
+        &mut writer,
+        job.codex_effort.as_deref().unwrap_or("").as_bytes(),
+    )?;
+    write_field(&mut writer, if job.host_auth { b"true" } else { b"false" })?;
     writer.flush().map_err(|e| format!("flush job: {e}"))
 }
 
@@ -60,13 +65,21 @@ pub fn read_job(mut reader: impl Read) -> Result<Job, String> {
     };
     let allowed_tools = read_string_list(&mut reader)?;
     let disallowed_tools = read_string_list(&mut reader)?;
+    let codex_effort = optional_string(read_string(&mut reader)?);
+    let host_auth = match read_string(&mut reader)?.as_str() {
+        "true" => true,
+        "false" => false,
+        _ => return Err("job host_auth must be true or false".to_owned()),
+    };
     Ok(Job {
         harness,
         api,
         base_url,
         model,
         token,
+        host_auth,
         prompt,
+        codex_effort,
         claude: crate::model::ClaudeOptions {
             effort,
             max_turns,
@@ -133,7 +146,7 @@ fn read_string(reader: &mut impl Read) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_job, write_job};
+    use super::{read_job, write_field, write_job};
     use crate::model::{ApiProtocol, ClaudeOptions, Harness, Job};
 
     #[test]
@@ -144,7 +157,9 @@ mod tests {
             base_url: "http://host.docker.internal:8080/v1".to_owned(),
             model: "test/model".to_owned(),
             token: "secret\0with newline\n".to_owned(),
+            host_auth: false,
             prompt: "修复这个项目。\nDo not stop early.".to_owned(),
+            codex_effort: Some("ultra".to_owned()),
             claude: ClaudeOptions {
                 effort: Some("high".to_owned()),
                 max_turns: Some(42),
@@ -160,5 +175,42 @@ mod tests {
     #[test]
     fn rejects_wrong_header() {
         assert!(read_job(b"not-a-job".as_slice()).is_err());
+    }
+
+    fn host_job() -> Job {
+        Job {
+            harness: Harness::Codex,
+            api: ApiProtocol::OpenAiResponses,
+            base_url: String::new(),
+            model: "gpt-6-astra".to_owned(),
+            token: String::new(),
+            host_auth: true,
+            prompt: "Return one short response.".to_owned(),
+            codex_effort: Some("ultra".to_owned()),
+            claude: ClaudeOptions::default(),
+        }
+    }
+
+    #[test]
+    fn job_round_trip_preserves_host_auth_without_a_token() {
+        let expected = host_job();
+        let mut encoded = Vec::new();
+        write_job(&mut encoded, &expected).unwrap();
+        assert!(encoded.starts_with(b"ASTRA_CODE_JOB_V3\0"));
+        assert_eq!(read_job(encoded.as_slice()).unwrap(), expected);
+    }
+
+    #[test]
+    fn rejects_missing_or_invalid_host_auth_field() {
+        let mut encoded = Vec::new();
+        write_job(&mut encoded, &host_job()).unwrap();
+        encoded.truncate(encoded.len() - 8); // length prefix plus "true"
+        assert!(read_job(encoded.as_slice()).is_err());
+        for flag in ["", "1", "false ", "TRUE"] {
+            let mut invalid = encoded.clone();
+            write_field(&mut invalid, flag.as_bytes()).unwrap();
+            let error = read_job(invalid.as_slice()).unwrap_err();
+            assert!(error.contains("host_auth"), "{error}");
+        }
     }
 }

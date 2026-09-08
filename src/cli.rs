@@ -3,6 +3,7 @@ use crate::model::{
     SecretSource, validate_pair,
 };
 use std::env;
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -66,6 +67,7 @@ fn parse_run(args: Vec<String>) -> Result<Command, String> {
     let mut base_url = None;
     let mut model = None;
     let mut token = None;
+    let mut host_auth = false;
     let mut prompt = None;
     let mut run_id = None;
     let mut workspace = env::current_dir().map_err(|e| format!("read current directory: {e}"))?;
@@ -81,6 +83,7 @@ fn parse_run(args: Vec<String>) -> Result<Command, String> {
     let mut dns_tcp = false;
     let mut read_only_mounts = Vec::new();
     let mut claude = ClaudeOptions::default();
+    let mut codex_effort = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -113,6 +116,12 @@ fn parse_run(args: Vec<String>) -> Result<Command, String> {
                 )?)),
                 "token source",
             )?,
+            "--host-auth" => {
+                if host_auth {
+                    return Err("--host-auth was specified more than once".to_owned());
+                }
+                host_auth = true;
+            }
             "--prompt" => set_once(
                 &mut prompt,
                 PromptSource::Inline(take_value(&args, &mut index, "--prompt")?),
@@ -160,6 +169,18 @@ fn parse_run(args: Vec<String>) -> Result<Command, String> {
                 &mut index,
                 "--read-only-mount",
             )?)?),
+            "--codex-effort" => {
+                let effort = take_value(&args, &mut index, "--codex-effort")?;
+                if !matches!(
+                    effort.as_str(),
+                    "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+                ) {
+                    return Err(format!(
+                        "invalid --codex-effort {effort:?}; expected low, medium, high, xhigh, max, or ultra"
+                    ));
+                }
+                set_once(&mut codex_effort, effort, "Codex effort")?;
+            }
             "--claude-effort" => {
                 let effort = take_value(&args, &mut index, "--claude-effort")?;
                 if !matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh" | "max") {
@@ -197,18 +218,48 @@ fn parse_run(args: Vec<String>) -> Result<Command, String> {
     }
 
     let harness = harness.ok_or("missing required --harness")?;
-    let api = api.ok_or("missing required --api")?;
+    let api = if host_auth {
+        if harness != Harness::Codex {
+            return Err("--host-auth requires --harness codex".to_owned());
+        }
+        if base_url.is_some() {
+            return Err("--host-auth cannot be combined with --base-url".to_owned());
+        }
+        if token.is_some() {
+            return Err(
+                "--host-auth cannot be combined with --token-env or --token-file".to_owned(),
+            );
+        }
+        if api.is_some_and(|value| value != ApiProtocol::OpenAiResponses) {
+            return Err("--host-auth requires --api openai-responses (or omit --api)".to_owned());
+        }
+        ApiProtocol::OpenAiResponses
+    } else {
+        api.ok_or("missing required --api")?
+    };
     validate_pair(harness, api)?;
     if harness != Harness::Claude && !claude.is_empty() {
         return Err("--claude-* options require --harness claude".to_owned());
     }
-
-    let base_url = require_non_empty(base_url, "--base-url")?;
-    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
-        return Err("--base-url must start with http:// or https://".to_owned());
+    if harness != Harness::Codex && codex_effort.is_some() {
+        return Err("--codex-* options require --harness codex".to_owned());
     }
+
     let model = require_non_empty(model, "--model")?;
-    let token = token.ok_or("missing token source; use --token-env or --token-file")?;
+    let (base_url, token) = if host_auth {
+        let auth = host_codex_auth_path(
+            env::var_os("CODEX_HOME").as_deref(),
+            env::var_os("HOME").as_deref(),
+        )?;
+        (String::new(), SecretSource::HostCodex(auth))
+    } else {
+        let base_url = require_non_empty(base_url, "--base-url")?;
+        if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+            return Err("--base-url must start with http:// or https://".to_owned());
+        }
+        let token = token.ok_or("missing token source; use --token-env or --token-file")?;
+        (base_url, token)
+    };
     if let Some(value) = run_id.as_deref() {
         validate_run_id(value)?;
     }
@@ -233,8 +284,22 @@ fn parse_run(args: Vec<String>) -> Result<Command, String> {
         dns,
         dns_tcp,
         read_only_mounts,
+        codex_effort,
         claude,
     })))
+}
+
+fn host_codex_auth_path(
+    codex_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Result<PathBuf, String> {
+    if let Some(directory) = codex_home.filter(|value| !value.is_empty()) {
+        Ok(PathBuf::from(directory).join("auth.json"))
+    } else if let Some(directory) = home.filter(|value| !value.is_empty()) {
+        Ok(PathBuf::from(directory).join(".codex/auth.json"))
+    } else {
+        Err("--host-auth requires CODEX_HOME or HOME to locate Codex auth.json".to_owned())
+    }
 }
 
 fn validate_run_id(value: &str) -> Result<(), String> {
@@ -327,10 +392,16 @@ pub fn print_run_help() {
         "Usage: astra-code run [OPTIONS]\n\n\
          Required:\n  \
            --harness NAME       codex, claude, pi, or opencode\n  \
+           --model MODEL        Provider model identifier\n\n\
+         Authentication (choose one mode):\n  \
+           --host-auth          Reuse host Codex login (codex only)\n  \
+                                Uses $CODEX_HOME/auth.json or $HOME/.codex/auth.json\n  \
+                                Native OpenAI provider; --api defaults to openai-responses\n  \
+                                Conflicts with --base-url, --token-env and --token-file\n\n\
+         API credentials mode (without --host-auth):\n  \
            --api PROTOCOL       openai-responses, openai-chat-completions,\n  \
                                 or anthropic-messages\n  \
            --base-url URL       API base URL\n  \
-           --model MODEL        Provider model identifier\n  \
            --token-env NAME     Read token from a host environment variable\n  \
              or --token-file PATH\n\n\
          Prompt (stdin if omitted):\n  \
@@ -352,6 +423,8 @@ pub fn print_run_help() {
            --output PATH        Run artifacts directory\n  \
            --keep-container     Do not pass --rm to Docker\n  \
            --dry-run            Print a redacted Docker command only\n\n\
+         Codex only:\n  \
+           --codex-effort LEVEL  low, medium, high, xhigh, max, or ultra\n\n\
          Claude only:\n  \
            --claude-effort LEVEL\n  \
            --claude-max-turns COUNT\n  \
@@ -376,8 +449,198 @@ pub fn print_harnesses() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_read_only_mount, take_value, validate_run_id};
+    use super::{
+        Command, host_codex_auth_path, parse_read_only_mount, parse_run, take_value,
+        validate_run_id,
+    };
+    use crate::model::{ApiProtocol, SecretSource};
+    use std::ffi::OsStr;
     use std::path::PathBuf;
+
+    fn run_args(harness: &str, extras: &[&str]) -> Vec<String> {
+        let mut args = vec![
+            "--harness",
+            harness,
+            "--api",
+            "openai-responses",
+            "--base-url",
+            "https://gateway.example/v1",
+            "--model",
+            "gpt-6-astra",
+            "--token-env",
+            "TEST_TOKEN",
+        ];
+        args.extend_from_slice(extras);
+        args.into_iter().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn accepts_codex_effort_levels() {
+        for effort in ["low", "medium", "high", "xhigh", "max", "ultra"] {
+            assert!(
+                parse_run(run_args("codex", &["--codex-effort", effort])).is_ok(),
+                "Codex effort {effort} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_or_duplicate_codex_effort() {
+        for extras in [
+            vec!["--codex-effort", "unlimited"],
+            vec!["--codex-effort", ""],
+            vec!["--codex-effort", "high", "--codex-effort", "ultra"],
+        ] {
+            assert!(parse_run(run_args("codex", &extras)).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_codex_effort_for_other_harnesses() {
+        let error = parse_run(run_args("pi", &["--codex-effort", "ultra"]))
+            .err()
+            .expect("non-Codex harness must reject Codex options");
+        assert!(error.contains("require --harness codex"), "{error}");
+    }
+
+    fn host_args(harness: &str, extras: &[&str]) -> Vec<String> {
+        let mut args = vec![
+            "--harness",
+            harness,
+            "--model",
+            "gpt-6-astra",
+            "--host-auth",
+        ];
+        args.extend_from_slice(extras);
+        args.into_iter().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn accepts_host_auth_without_api_url_or_token() {
+        for extras in [
+            vec![],
+            vec!["--api", "openai-responses", "--codex-effort", "ultra"],
+        ] {
+            let Command::Run(options) = parse_run(host_args("codex", &extras)).unwrap() else {
+                panic!("expected a run command");
+            };
+            assert_eq!(options.api, ApiProtocol::OpenAiResponses);
+            assert!(options.base_url.is_empty());
+            assert_eq!(options.model, "gpt-6-astra");
+            assert!(
+                matches!(options.token, SecretSource::HostCodex(ref path) if path.ends_with("auth.json"))
+            );
+            if !extras.is_empty() {
+                assert_eq!(options.codex_effort.as_deref(), Some("ultra"));
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_host_auth_with_custom_connection_or_token() {
+        for (option, value) in [
+            ("--base-url", "https://gateway.example/v1"),
+            ("--token-env", "TEST_TOKEN"),
+            ("--token-file", "/tmp/test-token"),
+        ] {
+            let error = parse_run(host_args("codex", &[option, value]))
+                .err()
+                .expect("host auth must reject custom credentials");
+            assert!(
+                error.contains("--host-auth") && error.contains(option),
+                "{error}"
+            );
+            assert!(!error.contains("unknown"), "{error}");
+        }
+    }
+
+    #[test]
+    fn restricts_host_auth_to_native_codex_responses() {
+        for harness in ["claude", "pi", "opencode"] {
+            let error = parse_run(host_args(harness, &[])).err().unwrap();
+            assert!(
+                error.contains("--host-auth") && error.contains("codex"),
+                "{error}"
+            );
+        }
+        for api in ["openai-chat-completions", "anthropic-messages"] {
+            let error = parse_run(host_args("codex", &["--api", api]))
+                .err()
+                .unwrap();
+            assert!(
+                error.contains("--host-auth") && error.contains("openai-responses"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_auth_still_requires_model() {
+        let args = ["--harness", "codex", "--host-auth"]
+            .map(str::to_owned)
+            .to_vec();
+        let error = parse_run(args).err().unwrap();
+        assert!(error.contains("--model"), "{error}");
+    }
+
+    #[test]
+    fn rejects_duplicate_host_auth() {
+        let error = parse_run(host_args("codex", &["--host-auth"]))
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("--host-auth") && error.contains("more than once"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn api_credentials_mode_still_requires_api_url_and_token() {
+        for (extras, required) in [
+            (vec![], "--api"),
+            (vec!["--api", "openai-responses"], "--base-url"),
+            (
+                vec![
+                    "--api",
+                    "openai-responses",
+                    "--base-url",
+                    "https://gateway.example/v1",
+                ],
+                "token source",
+            ),
+        ] {
+            let mut args = vec!["--harness", "codex", "--model", "gpt-6-astra"];
+            args.extend(extras);
+            let error = parse_run(args.into_iter().map(str::to_owned).collect())
+                .err()
+                .unwrap();
+            assert!(error.contains(required), "{error}");
+        }
+    }
+
+    #[test]
+    fn resolves_host_auth_path_without_changing_environment_or_reading_files() {
+        let custom = Some(OsStr::new("/custom/codex"));
+        let home = Some(OsStr::new("/home/tester"));
+        assert_eq!(
+            host_codex_auth_path(custom, home).unwrap(),
+            PathBuf::from("/custom/codex/auth.json")
+        );
+        assert_eq!(
+            host_codex_auth_path(custom, None).unwrap(),
+            PathBuf::from("/custom/codex/auth.json")
+        );
+        assert_eq!(
+            host_codex_auth_path(None, home).unwrap(),
+            PathBuf::from("/home/tester/.codex/auth.json")
+        );
+        assert_eq!(
+            host_codex_auth_path(Some(OsStr::new("")), home).unwrap(),
+            PathBuf::from("/home/tester/.codex/auth.json")
+        );
+        assert!(host_codex_auth_path(None, None).is_err());
+        assert!(host_codex_auth_path(None, Some(OsStr::new(""))).is_err());
+    }
 
     #[test]
     fn takes_option_value() {
