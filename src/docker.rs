@@ -260,16 +260,39 @@ fn docker_args(
                 "2048".to_owned(),
             ]);
         }
-        Profile::Pentest => {
-            args.extend([
-                "--security-opt".to_owned(),
-                "no-new-privileges".to_owned(),
-                "--cap-add".to_owned(),
-                "NET_RAW".to_owned(),
-                "--cap-add".to_owned(),
-                "NET_ADMIN".to_owned(),
-            ]);
-        }
+        Profile::Pentest => match ids {
+            // Root runtime: capabilities come from the container itself, so
+            // no-new-privileges stays on and only the network capabilities
+            // are granted.
+            Some((0, _)) | None => {
+                args.extend([
+                    "--security-opt".to_owned(),
+                    "no-new-privileges".to_owned(),
+                    "--cap-add".to_owned(),
+                    "NET_RAW".to_owned(),
+                    "--cap-add".to_owned(),
+                    "NET_ADMIN".to_owned(),
+                ]);
+            }
+            // Non-root runtime (Claude follows the caller identity): a
+            // non-root process holds no capabilities of its own, so tools
+            // such as nmap in astra-kali rely on their file capabilities.
+            // no-new-privileges would block that elevation at exec time, so
+            // it stays unset here; instead the bounding set is reduced to a
+            // least-privilege trio the tools can still elevate into.
+            Some(_) => {
+                args.extend([
+                    "--cap-drop".to_owned(),
+                    "ALL".to_owned(),
+                    "--cap-add".to_owned(),
+                    "NET_RAW".to_owned(),
+                    "--cap-add".to_owned(),
+                    "NET_ADMIN".to_owned(),
+                    "--cap-add".to_owned(),
+                    "NET_BIND_SERVICE".to_owned(),
+                ]);
+            }
+        },
     }
     if let Some((uid, gid)) = ids {
         args.extend(["--user".to_owned(), format!("{uid}:{gid}")]);
@@ -571,8 +594,14 @@ fn install_signal_handlers() {}
 
 #[cfg(test)]
 mod tests {
-    use super::{container_base_url, host_auth_mount_args, read_secret, runtime_ids};
-    use crate::model::{Harness, Profile, SecretSource};
+    use super::{
+        container_base_url, docker_args, effective_ids, host_auth_mount_args, read_secret,
+        runtime_ids,
+    };
+    use crate::model::{
+        ApiProtocol, ClaudeOptions, Harness, Profile, PromptSource, RunOptions, SecretSource,
+    };
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn host_auth_mounts_only_native_auth_file_and_preserves_refresh_writes() {
@@ -671,6 +700,99 @@ mod tests {
         assert_eq!(
             runtime_ids(Profile::Pentest, Harness::Codex, Some((2000, 3000))),
             Ok(Some((0, 0)))
+        );
+    }
+
+    fn pentest_options(harness: Harness, api: ApiProtocol) -> RunOptions {
+        RunOptions {
+            harness,
+            api,
+            base_url: "https://api.example".to_owned(),
+            model: "test-model".to_owned(),
+            token: SecretSource::Env("TEST_TOKEN".to_owned()),
+            prompt: PromptSource::Inline("probe".to_owned()),
+            run_id: Some("merge-test-run".to_owned()),
+            workspace: PathBuf::from("/tmp/astra-code-merge-test"),
+            output: None,
+            image: "astra-kali:latest".to_owned(),
+            timeout_seconds: 60,
+            profile: Profile::Pentest,
+            network: "host".to_owned(),
+            read_only_workspace: false,
+            keep_container: false,
+            dry_run: false,
+            dns: Vec::new(),
+            dns_tcp: false,
+            read_only_mounts: Vec::new(),
+            codex_effort: None,
+            claude: ClaudeOptions::default(),
+        }
+    }
+
+    #[test]
+    fn pentest_keeps_file_capabilities_for_non_root_runtimes() {
+        // Claude is the harness that follows the caller identity; the case
+        // only exists when the caller themselves is non-root.
+        if effective_ids().is_some_and(|(uid, _)| uid == 0) {
+            return;
+        }
+        let options = pentest_options(Harness::Claude, ApiProtocol::AnthropicMessages);
+        let args = docker_args(
+            &options,
+            Path::new("/tmp/astra-code-merge-test"),
+            Path::new("/usr/local/bin/astra-code"),
+            "merge-test-run",
+            "https://api.example",
+            false,
+            &[],
+        )
+        .unwrap();
+        let joined = args.join(" ");
+        assert!(
+            !joined.contains("no-new-privileges"),
+            "non-root runtimes have no capabilities of their own, so file capabilities must stay usable: {joined}"
+        );
+        for capability in ["NET_RAW", "NET_ADMIN", "NET_BIND_SERVICE"] {
+            assert!(
+                joined.contains(capability),
+                "missing {capability}: {joined}"
+            );
+        }
+        assert!(
+            joined.contains("cap-drop"),
+            "least-privilege set expected: {joined}"
+        );
+        assert!(
+            joined.contains("--user"),
+            "claude must run as the caller identity: {joined}"
+        );
+    }
+
+    #[test]
+    fn pentest_root_runtime_keeps_no_new_privileges() {
+        let options = pentest_options(Harness::Codex, ApiProtocol::OpenAiResponses);
+        let args = docker_args(
+            &options,
+            Path::new("/tmp/astra-code-merge-test"),
+            Path::new("/usr/local/bin/astra-code"),
+            "merge-test-run",
+            "https://api.example",
+            false,
+            &[],
+        )
+        .unwrap();
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("no-new-privileges"),
+            "root pentest runtimes keep the flag: {joined}"
+        );
+        assert!(
+            !joined.contains("NET_BIND_SERVICE"),
+            "root gets capabilities directly and needs no file-capability headroom: {joined}"
+        );
+        assert!(
+            joined.contains("--user 0:0"),
+            "non-claude pentest resolves to the root runtime: {joined}"
         );
     }
 }

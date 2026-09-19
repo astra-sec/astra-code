@@ -188,7 +188,11 @@ non-root UID/GID. The mounted workspace and the run-scoped tmpfs/ephemeral HOME
 are assigned to that same identity; no fixed image account or numeric UID is
 required. A root caller must use a non-root service account when selecting the
 Claude harness. Other harnesses retain the normal profile identity described
-above.
+above. Under `pentest`, a non-root runtime holds no capabilities of its own, so
+it drops every capability except `NET_RAW`, `NET_ADMIN`, and `NET_BIND_SERVICE`
+and leaves `no-new-privileges` unset; binaries that rely on file capabilities
+such as nmap can therefore still elevate. The root runtime keeps
+`no-new-privileges` on and is granted `NET_RAW` and `NET_ADMIN` directly.
 
 The shim clears the harness environment and restores only a small runtime
 allowlist from the image. This includes the image `PATH`, Playwright browser and
